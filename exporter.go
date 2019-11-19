@@ -9,17 +9,20 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
+	"github.com/tidwall/gjson"
 )
 
-var mutex sync.RWMutex
+var (
+	mutex            sync.RWMutex
+	metricLabelNames = []string{"job", "type", "metric", "topic"}
+)
 
 type mqttExporter struct {
 	client         mqtt.Client
 	versionDesc    *prometheus.Desc
 	connectDesc    *prometheus.Desc
-	metrics        map[string]*prometheus.GaugeVec   // hold the metrics collected
-	counterMetrics map[string]*prometheus.CounterVec // hold the metrics collected
-	metricsLabels  map[string][]string               // holds the labels set for each metric to be able to invalidate them
+	metrics        map[string]*prometheus.GaugeVec   // holds the metrics collected
+	counterMetrics map[string]*prometheus.CounterVec // holds the metrics collected
 }
 
 func newMQTTExporter() *mqttExporter {
@@ -58,7 +61,6 @@ func newMQTTExporter() *mqttExporter {
 
 	c.metrics = make(map[string]*prometheus.GaugeVec)
 	c.counterMetrics = make(map[string]*prometheus.CounterVec)
-	c.metricsLabels = make(map[string][]string)
 
 	m.Subscribe(*topic, 2, c.receiveMessage())
 
@@ -102,85 +104,69 @@ func (c *mqttExporter) Collect(ch chan<- prometheus.Metric) {
 		m.Collect(ch)
 	}
 }
+
+/*
+Topic is Tasmota MQTT telemetry format (with setoption19 enabled - home assistant discovery) so needs the following FullTopic format: %topic%/%prefix%/<command>
+As explained here: https://github.com/arendst/Tasmota/wiki/Home-Assistant
+device_name/tele/SENSOR = {"Time":"2019-11-19T00:20:06","AM2301":{"Temperature":20.5,"Humidity":44.4},"TempUnit":"C"}
+job/type/metric = json_data
+*/
 func (e *mqttExporter) receiveMessage() func(mqtt.Client, mqtt.Message) {
 	return func(c mqtt.Client, m mqtt.Message) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		t := m.Topic()
-		t = strings.TrimPrefix(m.Topic(), *prefix)
-		t = strings.TrimPrefix(t, "/")
-		parts := strings.Split(t, "/")
-		if len(parts)%2 == 0 {
-			log.Warnf("Invalid topic: %s: odd number of levels, ignoring", t)
+
+		topic := m.Topic()
+		log.Debugf("Receiving %s = %s\n", topic, string(m.Payload()))
+		parts := strings.Split(topic, "/")
+		if len(parts) != 3 {
+			log.Warnf("Invalid topic ! %s: number of levels is not 3, ignoring", topic)
 			return
 		}
-		metric_name := parts[len(parts)-1]
-		pushed_metric_name := fmt.Sprintf("mqtt_%s_last_pushed_timestamp", metric_name)
-		count_metric_name := fmt.Sprintf("mqtt_%s_push_total", metric_name)
-		metric_labels := parts[:len(parts)-1]
-		var labels []string
-		labelValues := prometheus.Labels{}
-		log.Debugf("Metric name: %v", metric_name)
-		for i, l := range metric_labels {
-			if i%2 == 1 {
-				continue
-			}
-			labels = append(labels, l)
-			labelValues[l] = metric_labels[i+1]
-		}
 
-		invalidate := false
-		if _, ok := e.metricsLabels[metric_name]; ok {
-			l := e.metricsLabels[metric_name]
-			if !compareLabels(l, labels) {
-				log.Warnf("Label names are different: %v and %v, invalidating existing metric", l, labels)
-				prometheus.Unregister(e.metrics[metric_name])
-				invalidate = true
-			}
-		}
-		e.metricsLabels[metric_name] = labels
-		if _, ok := e.metrics[metric_name]; ok && !invalidate {
-			log.Debugf("Metric already exists")
-		} else {
-			log.Debugf("Creating new metric: %s %v", metric_name, labels)
-			e.metrics[metric_name] = prometheus.NewGaugeVec(
+		jobName := parts[0]
+		topicType := parts[1]
+		metricType := parts[2]
+
+		metricName := "temperature"
+		labelValues := prometheus.Labels{}
+		labelValues["job"] = jobName
+		labelValues["type"] = topicType
+		labelValues["metric"] = metricType
+		labelValues["topic"] = topic
+
+		if m, err := strconv.ParseFloat(gjson.GetBytes(m.Payload(), "*.Temperature").String(), 32); err == nil {
+			log.Debugf("Creating new metric: %s %v", metricName, metricLabelNames)
+			e.metrics[metricName] = prometheus.NewGaugeVec(
 				prometheus.GaugeOpts{
-					Name: metric_name,
+					Name: metricName,
 					Help: "Metric pushed via MQTT",
 				},
-				labels,
+				metricLabelNames,
 			)
-			e.counterMetrics[count_metric_name] = prometheus.NewCounterVec(
-				prometheus.CounterOpts{
-					Name: count_metric_name,
-					Help: fmt.Sprintf("Number of times %s was pushed via MQTT", metric_name),
-				},
-				labels,
-			)
-			e.metrics[pushed_metric_name] = prometheus.NewGaugeVec(
-				prometheus.GaugeOpts{
-					Name: pushed_metric_name,
-					Help: fmt.Sprintf("Last time %s was pushed via MQTT", metric_name),
-				},
-				labels,
-			)
-		}
-		if s, err := strconv.ParseFloat(string(m.Payload()), 64); err == nil {
-			e.metrics[metric_name].With(labelValues).Set(s)
-			e.metrics[pushed_metric_name].With(labelValues).SetToCurrentTime()
-			e.counterMetrics[count_metric_name].With(labelValues).Inc()
-		}
-	}
-}
 
-func compareLabels(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, v := range a {
-		if v != b[i] {
-			return false
+			countMetricName := "mqtt_push_total"
+			e.counterMetrics[countMetricName] = prometheus.NewCounterVec(
+				prometheus.CounterOpts{
+					Name: countMetricName,
+					Help: fmt.Sprintf("Number of times metric has been pushed via MQTT"),
+				},
+				metricLabelNames,
+			)
+
+			lastPushTimeMetricName := "mqtt_last_pushed_timestamp"
+			e.metrics[lastPushTimeMetricName] = prometheus.NewGaugeVec(
+				prometheus.GaugeOpts{
+					Name: lastPushTimeMetricName,
+					Help: fmt.Sprintf("Last time metric was pushed via MQTT"),
+				},
+				metricLabelNames,
+			)
+
+			log.Debugf("Temperature for %s = %.1f", jobName, m)
+			e.metrics[metricName].With(labelValues).Set(m)
+			e.metrics[lastPushTimeMetricName].With(labelValues).SetToCurrentTime()
+			e.counterMetrics[countMetricName].With(labelValues).Inc()
 		}
 	}
-	return true
 }
