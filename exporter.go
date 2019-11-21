@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/nmaupu/mqttgateway/conf"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/tidwall/gjson"
@@ -48,12 +49,12 @@ func newMQTTExporter() *mqttExporter {
 	c := &mqttExporter{
 		client: m,
 		versionDesc: prometheus.NewDesc(
-			prometheus.BuildFQName(progname, "build", "info"),
+			prometheus.BuildFQName(Progname, "build", "info"),
 			"Build info of this instance",
 			nil,
 			prometheus.Labels{"version": version}),
 		connectDesc: prometheus.NewDesc(
-			prometheus.BuildFQName(progname, "mqtt", "connected"),
+			prometheus.BuildFQName(Progname, "mqtt", "connected"),
 			"Is the exporter connected to mqtt broker",
 			nil,
 			nil),
@@ -117,56 +118,77 @@ func (e *mqttExporter) receiveMessage() func(mqtt.Client, mqtt.Message) {
 		defer mutex.Unlock()
 
 		topic := m.Topic()
-		log.Debugf("Receiving %s = %s\n", topic, string(m.Payload()))
-		parts := strings.Split(topic, "/")
-		if len(parts) != 3 {
-			log.Warnf("Invalid topic ! %s: number of levels is not 3, ignoring", topic)
+
+		// Match if topic is in config
+		configMqttTopic := Config.GetTopic(topic)
+		if configMqttTopic == nil {
+			log.Debugf("Topic %s does not match any conf, skipping. value=%+v\n", topic, string(m.Payload()))
 			return
 		}
 
-		jobName := parts[0]
-		topicType := parts[1]
-		metricType := parts[2]
+		log.Debugf("%s matches config, processing it (value = %s)\n", topic, string(m.Payload()))
 
-		metricName := "temperature"
-		labelValues := prometheus.Labels{}
-		labelValues["job"] = jobName
-		labelValues["type"] = topicType
-		labelValues["metric"] = metricType
-		labelValues["topic"] = topic
-
-		if m, err := strconv.ParseFloat(gjson.GetBytes(m.Payload(), "*.Temperature").String(), 32); err == nil {
-			log.Debugf("Creating new metric: %s %v", metricName, metricLabelNames)
-			e.metrics[metricName] = prometheus.NewGaugeVec(
-				prometheus.GaugeOpts{
-					Name: metricName,
-					Help: "Metric pushed via MQTT",
-				},
-				metricLabelNames,
-			)
-
-			countMetricName := "mqtt_push_total"
-			e.counterMetrics[countMetricName] = prometheus.NewCounterVec(
-				prometheus.CounterOpts{
-					Name: countMetricName,
-					Help: fmt.Sprintf("Number of times metric has been pushed via MQTT"),
-				},
-				metricLabelNames,
-			)
-
-			lastPushTimeMetricName := "mqtt_last_pushed_timestamp"
-			e.metrics[lastPushTimeMetricName] = prometheus.NewGaugeVec(
-				prometheus.GaugeOpts{
-					Name: lastPushTimeMetricName,
-					Help: fmt.Sprintf("Last time metric was pushed via MQTT"),
-				},
-				metricLabelNames,
-			)
-
-			log.Debugf("Temperature for %s = %.1f", jobName, m)
-			e.metrics[metricName].With(labelValues).Set(m)
-			e.metrics[lastPushTimeMetricName].With(labelValues).SetToCurrentTime()
-			e.counterMetrics[countMetricName].With(labelValues).Inc()
+		// Get patterns to get
+		gjsonPatterns := configMqttTopic.GetAllPatterns()
+		for _, v := range gjsonPatterns {
+			e.processPattern(m, v)
 		}
+	}
+}
+
+func (e *mqttExporter) processPattern(message mqtt.Message, p conf.ConfigGjsonPattern) {
+	topic := message.Topic()
+	parts := strings.Split(topic, "/")
+	if len(parts) != 3 {
+		log.Warnf("Invalid topic ! %s: number of levels is not 3, ignoring", topic)
+		return
+	}
+
+	jobName := parts[0]
+	topicType := parts[1]
+	metricType := parts[2]
+
+	mapIndex := fmt.Sprintf("%s-%s", topic, p.Name)
+	metricName := p.Name
+	labelValues := prometheus.Labels{}
+	labelValues["job"] = jobName
+	labelValues["type"] = topicType
+	labelValues["metric"] = metricType
+	labelValues["topic"] = topic
+
+	mqttValue, err := strconv.ParseFloat(
+		gjson.GetBytes(message.Payload(), p.Pattern).String(), 32)
+	if err == nil {
+		log.Debugf("Creating new metric: %s %+v\n", metricName, metricLabelNames)
+		e.metrics[mapIndex] = prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: metricName,
+				Help: "Metric pushed via MQTT",
+			},
+			metricLabelNames,
+		)
+
+		countMetricName := "mqtt_push_total"
+		e.counterMetrics[countMetricName] = prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: countMetricName,
+				Help: fmt.Sprintf("Number of times metric has been pushed via MQTT"),
+			},
+			metricLabelNames,
+		)
+
+		lastPushTimeMetricName := "mqtt_last_pushed_timestamp"
+		e.metrics[lastPushTimeMetricName] = prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: lastPushTimeMetricName,
+				Help: fmt.Sprintf("Last time metric was pushed via MQTT"),
+			},
+			metricLabelNames,
+		)
+
+		log.Debugf("%s for %s = %.1f", p.Name, jobName, mqttValue)
+		e.metrics[mapIndex].With(labelValues).Set(mqttValue)
+		e.metrics[lastPushTimeMetricName].With(labelValues).SetToCurrentTime()
+		e.counterMetrics[countMetricName].With(labelValues).Inc()
 	}
 }

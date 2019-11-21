@@ -1,0 +1,23 @@
+---
+
+topics:
+  - topic: estrade/tele/SENSOR
+    patterns:
+    - name: temperature
+      pattern: "*.Temperature"
+    - name: humidity
+      pattern: "*.Humidity"
+  - topic: estrade/tele/HASS_STATE
+    patterns:
+    - name: uptimeSec
+      pattern: UptimeSec
+    - name: heap
+      pattern: Heap
+    - name: mqttCount
+      pattern: MqttCount
+    - name: bootCount
+      pattern: BootCount
+    - name: saveCount
+      pattern: SaveCount
+    - name: loadAvg
+      pattern: LoadAvg
