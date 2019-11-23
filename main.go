@@ -54,6 +54,9 @@ func main() {
 	prometheus.MustRegister(newMQTTExporter())
 
 	http.Handle(*metricsPath, promhttp.Handler())
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "UP")
+	})
 	log.Infoln("Listening on", *listenAddress)
 	err = http.ListenAndServe(*listenAddress, nil)
 	if err != nil {
