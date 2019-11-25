@@ -63,6 +63,7 @@ func newMQTTExporter() *mqttExporter {
 	c.metrics = make(map[string]*prometheus.GaugeVec)
 	c.counterMetrics = make(map[string]*prometheus.CounterVec)
 
+	log.Debugf("Subscribing to topic %s", *topic)
 	m.Subscribe(*topic, 2, c.receiveMessage())
 
 	return c
