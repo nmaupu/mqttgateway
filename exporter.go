@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/nmaupu/mqttgateway/conf"
@@ -16,6 +17,12 @@ import (
 var (
 	mutex            sync.RWMutex
 	metricLabelNames = []string{"job", "type", "metric", "topic"}
+	mqttClient       mqtt.Client
+	exporter         *mqttExporter
+)
+
+const (
+	mqttMaxReconnectInterval = 30 * time.Second
 )
 
 type mqttExporter struct {
@@ -40,14 +47,23 @@ func newMQTTExporter() *mqttExporter {
 	if *clientID != "" {
 		options.SetClientID(*clientID)
 	}
-	m := mqtt.NewClient(options)
-	if token := m.Connect(); token.Wait() && token.Error() != nil {
-		log.Fatal(token.Error())
+	options.MaxReconnectInterval = mqttMaxReconnectInterval
+	options.ConnectRetry = true
+	options.OnReconnecting = func(client mqtt.Client, options *mqtt.ClientOptions) {
+		log.Infof("Trying to reconnect to MQTT server %+v", options.Servers)
+	}
+	options.OnConnectionLost = func(client mqtt.Client, reason error) {
+		log.Infof("MQTT connection has been lost, reason=%+v", reason)
+	}
+	options.OnConnect = func(client mqtt.Client) {
+		log.Debugf("OnConnectHandler func called")
+		log.Debugf("Subscribing to topic %s", *topic)
+		mqttClient.Subscribe(*topic, 2, exporter.receiveMessage())
 	}
 
-	// create an exporter
-	c := &mqttExporter{
-		client: m,
+	mqttClient = mqtt.NewClient(options)
+	exporter = &mqttExporter{
+		client: mqttClient,
 		versionDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(Progname, "build", "info"),
 			"Build info of this instance",
@@ -60,13 +76,14 @@ func newMQTTExporter() *mqttExporter {
 			nil),
 	}
 
-	c.metrics = make(map[string]*prometheus.GaugeVec)
-	c.counterMetrics = make(map[string]*prometheus.CounterVec)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		log.Fatal(token.Error())
+	}
 
-	log.Debugf("Subscribing to topic %s", *topic)
-	m.Subscribe(*topic, 2, c.receiveMessage())
+	exporter.metrics = make(map[string]*prometheus.GaugeVec)
+	exporter.counterMetrics = make(map[string]*prometheus.CounterVec)
 
-	return c
+	return exporter
 }
 
 func (c *mqttExporter) Describe(ch chan<- *prometheus.Desc) {
