@@ -157,14 +157,27 @@ func (e *mqttExporter) receiveMessage() func(mqtt.Client, mqtt.Message) {
 func (e *mqttExporter) processPattern(message mqtt.Message, p conf.ConfigGjsonPattern) {
 	topic := message.Topic()
 	parts := strings.Split(topic, "/")
-	if len(parts) != 3 {
-		log.Warnf("Invalid topic ! %s: number of levels is not 3, ignoring", topic)
+	if len(parts) < 2 {
+		log.Warnf("Invalid topic ! %s: number of levels is >= 2, ignoring", topic)
 		return
 	}
 
 	jobName := parts[0]
-	topicType := parts[1]
-	metricType := parts[2]
+	topicType := ""
+	metricType := ""
+
+	if len(parts) == 3 { // ESP devices
+		topicType = parts[1]
+		metricType = parts[2]
+	} else if len(parts) == 2 && jobName == "zigbee2mqtt" { // Zigbee devices
+		topicType = parts[0]
+		jobName = parts[1]
+		metricType = "SENSOR"
+	} else {
+		// unknown
+		topicType = parts[1]
+		metricType = "unknown"
+	}
 
 	mapIndex := fmt.Sprintf("%s-%s", topic, p.Name)
 	metricName := p.Name
